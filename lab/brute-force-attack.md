@@ -15,21 +15,26 @@
 
 ## 02. Executive Summary
 
-A controlled SMB authentication test was performed from the Kali Linux lab VM against the Windows `soc_lab` account. Windows recorded the failed network logons as Event ID `4625`, and Splunk correlated four failures from the same source IP and account, then triggered the scheduled detection alert. The investigation found no Event ID `4624` in the reviewed 15:14–15:25 window; no successful compromise was established by the collected evidence.
+- A controlled SMB authentication test was performed from the Kali Linux lab VM against the Windows `soc_lab` account.
+- Windows recorded the failed network logons as Event ID `4625`
+- Splunk correlated four failures from the same source IP and same account then triggered the scheduled detection alert.
+- The investigation found no Event ID `4624` in the reviewed 15:14–15:25 window.
+- no successful compromise was established by the collected evidence.
 
 ## 03. Attack Simulation – Red Team Context
 
+- A dedicated local account `soc_lab` and a lab share named `SOC-Lab` were used.
+- A successful baseline SMB login had previously confirmed that the account and share were reachable.
 - The test was run from the Kali VM (`192.168.64.6`) against the Windows VM (`192.168.64.8`) over SMB.
-- A dedicated local account, `soc_lab`, and a lab share named `SOC-Lab` were used. A successful baseline SMB login had previously confirmed that the account and share were reachable.
-- Four incorrect-password attempts were made manually. The attempts were controlled lab activity, not activity against an external system.
+- Four incorrect-password attempts were made manually.
 
-Command used from Kali (the password was entered interactively and is intentionally not included):
+- Command used from Kali.(the password was entered intentionally wrong)
 
 ```bash
 smbclient //192.168.64.8/SOC-Lab -U 'DESKTOP-PPSKJ22\soc_lab'
 ```
 
-The four failed attempts were observed on Windows at:
+The four failed attempts were observed on Windows at
 
 | Time (20 November 2026, IST) | Windows event |
 |---|---|
@@ -38,15 +43,116 @@ The four failed attempts were observed on Windows at:
 | 15:14:20 | Event ID 4625 |
 | 15:14:41 | Event ID 4625 |
 
-All four events identified `soc_lab` as the target account and `192.168.64.6` as the source IP. The source workstation was reported as `KALI` in the Windows event evidence.
+- All four events identified `soc_lab` as the target account and `192.168.64.6` as the source IP. 
+- The source workstation was reported as `KALI` in the Windows event evidence.
 
 ## 04. Detection Engineering – Splunk SPL
 
-### Primary detection search
-
-The following search was executed successfully and returned the four-attempt detection result for the controlled test:
+####  1. Confirm Logs Are Arriving
 
 ```spl
+index=* "soc_lab" earliest=-30m
+```
+
+- Windows event data were arriving.
+- The target account "soc_lab" appears in the events.
+- Raw XML contains information such as Event ID, target username and IP address.
+
+#### 2. Extract Fields from Raw XML
+```spl
+index=* "soc_lab" earliest=-30m
+|rex field=_raw "Name='TargetUserName'>(?<target_user>[^<]+)"
+|rex field=_raw "Name='IpAddress'>(?<source_ip>[^<]+)"
+|rex field=_raw "Name='WorkstationName'>(?<source_workstation>[^<]+)"
+|rex field=_raw "<EventID>(?<event_id>\d+)</EventID>"
+```
+
+- The required fields were not populated by "spath" for this raw XML format during testing. 
+- Therefore "rex" was used to extract the values directly from "_raw".
+- The rex : command creates searchable fields from the raw event. It does not modify the original Windows event.
+
+target_user : Identifies the account being targeted.
+source_ip : Identifies the IP address generating the authentication attempt.
+source_workstation : Identifies the source computer name.
+event_id : Identifies which Windows security event occurred.
+
+
+
+#### 3: Filter Only Failed Logons
+```
+| search event_id=4625
+```
+
+- Windows records different authentication outcomes:
+4624 — Successful logon.
+4625 — Failed logon.
+
+- For this detection we only need failed authentication attempts.
+-  event_id=4625 removes unrelated successful logon events from the detection calculation.
+
+#### 4. Preserve Exact Timestamps and Create Time Buckets
+```
+| eval event_time=_time
+| bin _time span=5m
+```
+
+- We need to identify repeated failures within a short period.
+ eval event_time=_time (saves the original event timestamp)
+ bin _time span=5m (groups events into fixed five-minute time buckets)
+
+##### 5. Aggregate Failures and Apply the Detection Threshold
+```
+| stats count as failed_attempts
+    min(event_time) as first_seen
+    max(event_time) as last_seen
+    values(host) as target_host
+    values(source_workstation) as source_workstation
+    by _time source_ip target_user
+| where failed_attempts >= 4
+```
+
+This is the main detection logic.
+
+- The stats command groups events using three fields
+_time (Groups events into the same five-minute bucket)
+ source_ip (Separates attempts coming from different source IPs)
+ target_user (Separates attempts against different accounts.
+
+Other calculations:
+
+- "count as failed_attempts" counts failed logons in each group.
+- "min(event_time) as first_seen" identifies the first actual attempt.
+- "max(event_time) as last_seen" identifies the last actual attempt.
+- "values(host) as target_host" records the Windows target hostname.
+- "values(source_workstation) as source_workstation" records the source workstation name.
+- "where failed_attempts >= 4" keeps only groups containing four or more failures.
+
+
+- Why group by source IP and target account?
+Without these fields, failures from different computers or against different accounts could be combined into one count. Grouping ensures that the detection evaluates each source-and-account combination separately.
+
+#### 6. Format Timestamps and Display the Final Results
+```
+| eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S")
+| eval last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+| table first_seen last_seen target_host source_ip source_workstation target_user failed_attempts
+| sort -_time
+```
+- "strftime()" converts epoch timestamps into readable date and time values.
+- "table" displays only the fields needed by a SOC analyst.
+- "sort -_time" sorts results by time in descending order when "_time" is retained.
+
+Note: Because the final "table" above does not retain "_time", use the following corrected final ordering if you want to sort the displayed detection results by the original bucket time:
+
+| sort -_time
+| eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S")
+| eval last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+| table first_seen last_seen target_host source_ip source_workstation target_user failed_attempts
+
+#### 7. Complete Detection SPL
+
+This is the complete query that was executed and successfully validated in the lab:
+```
 index=* "soc_lab" earliest=-30m
 | rex field=_raw "Name='TargetUserName'>(?<target_user>[^<]+)"
 | rex field=_raw "Name='IpAddress'>(?<source_ip>[^<]+)"
