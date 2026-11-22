@@ -1,4 +1,4 @@
-# Stage 4 --- Windows Local Account Creation and Administrators Group Modification
+# Windows Local Account Creation and Administrators Group Modification
 
 ## Overview
 
