@@ -1,4 +1,4 @@
-# Stage 5 — Windows PowerShell Encoded Command Execution Detection and Investigation
+# Windows PowerShell Encoded Command Execution Detection and Investigation
 
 ## 1. Overview
 
